@@ -2,14 +2,27 @@ const db = require('../db');
 
 async function list(_req, res, next) {
   try {
-    const [rows] = await db.query('SELECT * FROM v_project_summary ORDER BY project_id DESC');
+    const [rows] = await db.query(
+      `SELECT v.*, p2.territory_id, t.name AS territory_name
+       FROM v_project_summary v
+       JOIN projects p2 ON p2.id = v.project_id
+       LEFT JOIN territories t ON t.id = p2.territory_id
+       ORDER BY v.project_id DESC`
+    );
     res.json(rows);
   } catch (err) { next(err); }
 }
 
 async function get(req, res, next) {
   try {
-    const [rows] = await db.query('SELECT * FROM v_project_summary WHERE project_id = ?', [req.params.id]);
+    const [rows] = await db.query(
+      `SELECT v.*, p2.territory_id, t.name AS territory_name
+       FROM v_project_summary v
+       JOIN projects p2 ON p2.id = v.project_id
+       LEFT JOIN territories t ON t.id = p2.territory_id
+       WHERE v.project_id = ?`,
+      [req.params.id]
+    );
     if (!rows[0]) return res.status(404).json({ message: 'Project not found' });
     res.json(rows[0]);
   } catch (err) { next(err); }
@@ -17,13 +30,13 @@ async function get(req, res, next) {
 
 async function create(req, res, next) {
   try {
-    const { name, description, template_id, start_date, expected_end_date } = req.body;
+    const { name, description, template_id, start_date, expected_end_date, territory_id } = req.body;
     const conn = await db.getConnection();
     await conn.beginTransaction();
     try {
       const [pRows] = await conn.query(
-        'INSERT INTO projects (name, description, template_id, start_date, expected_end_date, created_by) VALUES (?, ?, ?, ?, ?, ?) RETURNING id',
-        [name, description, template_id || null, start_date || null, expected_end_date || null, req.user.id]
+        'INSERT INTO projects (name, description, template_id, start_date, expected_end_date, territory_id, created_by) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id',
+        [name, description, template_id || null, start_date || null, expected_end_date || null, territory_id || null, req.user.id]
       );
       const projectId = pRows[0].id;
 
@@ -37,9 +50,9 @@ async function create(req, res, next) {
         for (const tt of templateTasks) {
           const [tRows] = await conn.query(
             `INSERT INTO tasks (project_id, title, description, department_id, status, tat_type, tat_days,
-                               is_from_template, template_task_id, priority, created_by)
-             VALUES (?, ?, ?, ?, 'pending', 'days', ?, true, ?, 'medium', ?) RETURNING id`,
-            [projectId, tt.title, tt.description, tt.department_id, tt.tat_days, tt.id, req.user.id]
+                               is_from_template, template_task_id, priority, territory_id, created_by)
+             VALUES (?, ?, ?, ?, 'pending', 'days', ?, true, ?, 'medium', ?, ?) RETURNING id`,
+            [projectId, tt.title, tt.description, tt.department_id, tt.tat_days, tt.id, territory_id || null, req.user.id]
           );
           idMap[tt.id] = tRows[0].id;
         }
@@ -66,10 +79,10 @@ async function create(req, res, next) {
 
 async function update(req, res, next) {
   try {
-    const { name, description, status, start_date, expected_end_date } = req.body;
+    const { name, description, status, start_date, expected_end_date, territory_id } = req.body;
     await db.query(
-      'UPDATE projects SET name=?, description=?, status=?, start_date=?, expected_end_date=? WHERE id=?',
-      [name, description, status, start_date || null, expected_end_date || null, req.params.id]
+      'UPDATE projects SET name=?, description=?, status=?, start_date=?, expected_end_date=?, territory_id=? WHERE id=?',
+      [name, description, status, start_date || null, expected_end_date || null, territory_id || null, req.params.id]
     );
     res.json({ message: 'Project updated' });
   } catch (err) { next(err); }

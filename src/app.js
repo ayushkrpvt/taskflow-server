@@ -11,6 +11,7 @@ const templateRoutes    = require('./routes/templates.routes');
 const taskRoutes        = require('./routes/tasks.routes');
 const commentRoutes     = require('./routes/comments.routes');
 const attachmentRoutes  = require('./routes/attachments.routes');
+const territoryRoutes   = require('./routes/territories.routes');
 
 const app = express();
 
@@ -27,6 +28,7 @@ app.use('/api/templates',   templateRoutes);
 app.use('/api/tasks',       taskRoutes);
 app.use('/api/comments',    commentRoutes);
 app.use('/api/attachments', attachmentRoutes);
+app.use('/api/territories', territoryRoutes);
 
 app.get('/api/health', (_req, res) => res.json({ status: 'ok' }));
 

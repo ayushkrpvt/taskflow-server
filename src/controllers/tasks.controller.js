@@ -6,12 +6,14 @@ async function list(req, res, next) {
     const { project_id, status, department_id: deptFilter, assigned_to } = req.query;
 
     let sql = `SELECT t.*, p.name AS project_name, d.name AS department_name,
-                      u.name AS assigned_to_name, ab.name AS assigned_by_name
+                      u.name AS assigned_to_name, ab.name AS assigned_by_name,
+                      tr.name AS territory_name
                FROM tasks t
                JOIN projects p  ON p.id = t.project_id
                LEFT JOIN departments d  ON d.id = t.department_id
                LEFT JOIN users u        ON u.id = t.assigned_to
                LEFT JOIN users ab       ON ab.id = t.assigned_by
+               LEFT JOIN territories tr ON tr.id = t.territory_id
                WHERE t.parent_task_id IS NULL`;
     const p = [];
 
@@ -33,13 +35,15 @@ async function get(req, res, next) {
   try {
     const [tasks] = await db.query(
       `SELECT t.*, p.name AS project_name, d.name AS department_name,
-              u.name AS assigned_to_name, ab.name AS assigned_by_name, rv.name AS reviewed_by_name
+              u.name AS assigned_to_name, ab.name AS assigned_by_name, rv.name AS reviewed_by_name,
+              tr.name AS territory_name
        FROM tasks t
        JOIN projects p        ON p.id  = t.project_id
        LEFT JOIN departments d ON d.id  = t.department_id
        LEFT JOIN users u       ON u.id  = t.assigned_to
        LEFT JOIN users ab      ON ab.id = t.assigned_by
        LEFT JOIN users rv      ON rv.id = t.reviewed_by
+       LEFT JOIN territories tr ON tr.id = t.territory_id
        WHERE t.id = ?`,
       [req.params.id]
     );
@@ -78,10 +82,95 @@ async function get(req, res, next) {
   } catch (err) { next(err); }
 }
 
+/**
+ * Auto-assign a task to the next employee in round-robin order
+ * based on territory + department mapping.
+ *
+ * @param {object} conn       - DB connection (with transaction already open)
+ * @param {number} taskId
+ * @param {number} territoryId
+ * @param {number} departmentId
+ * @param {number} createdBy  - user id of the creator (used as assigned_by)
+ */
+async function autoAssign(conn, taskId, territoryId, departmentId, createdBy) {
+  // 1. Fetch the task's tat info so we can compute due_date
+  const [taskRows] = await conn.query(
+    'SELECT tat_type, tat_days, due_date FROM tasks WHERE id = ?',
+    [taskId]
+  );
+  const task = taskRows[0];
+  if (!task) return; // safety guard
+
+  // 2. Find active employees in this territory + department, ordered by id
+  const [employees] = await conn.query(
+    `SELECT u.id FROM users u
+     JOIN employee_territories et ON et.user_id = u.id
+     WHERE u.role = 'employee'
+       AND u.is_active = true
+       AND et.territory_id = ?
+       AND u.department_id = ?
+     ORDER BY u.id`,
+    [territoryId, departmentId]
+  );
+
+  if (!employees || employees.length === 0) return; // no one to assign
+
+  // 3. Check tracker for last assigned user
+  const [trackerRows] = await conn.query(
+    'SELECT last_assigned_user_id FROM territory_assignment_tracker WHERE territory_id = ? AND department_id = ?',
+    [territoryId, departmentId]
+  );
+  const lastAssignedId = trackerRows[0] ? trackerRows[0].last_assigned_user_id : null;
+
+  // 4. Pick next in round-robin
+  let nextEmployee = employees[0]; // default: first
+  if (lastAssignedId !== null) {
+    const lastIndex = employees.findIndex(e => e.id === lastAssignedId);
+    if (lastIndex !== -1 && lastIndex + 1 < employees.length) {
+      nextEmployee = employees[lastIndex + 1];
+    }
+    // if lastAssignedId was the last one, wrap around to index 0 (already defaulted)
+  }
+  const assignedTo = nextEmployee.id;
+
+  // 5. Compute due_date from tat_type/tat_days if not already set
+  let computedDueDate = task.due_date || null;
+  if (!computedDueDate && task.tat_type === 'days' && task.tat_days) {
+    const d = new Date();
+    d.setDate(d.getDate() + Number(task.tat_days));
+    computedDueDate = d.toISOString().slice(0, 10);
+  }
+
+  // 6. Update the task
+  await conn.query(
+    `UPDATE tasks
+     SET assigned_to = ?, assigned_by = ?, assigned_at = NOW(),
+         status = 'assigned', due_date = COALESCE(due_date, ?)
+     WHERE id = ?`,
+    [assignedTo, createdBy, computedDueDate, taskId]
+  );
+
+  // 7. Insert task_status_history
+  await conn.query(
+    `INSERT INTO task_status_history (task_id, changed_by, old_status, new_status, note)
+     VALUES (?, ?, 'pending', 'assigned', 'Auto-assigned by territory')`,
+    [taskId, createdBy]
+  );
+
+  // 8. UPSERT territory_assignment_tracker
+  await conn.query(
+    `INSERT INTO territory_assignment_tracker (territory_id, department_id, last_assigned_user_id, updated_at)
+     VALUES (?, ?, ?, NOW())
+     ON CONFLICT (territory_id, department_id) DO UPDATE
+     SET last_assigned_user_id = ?, updated_at = NOW()`,
+    [territoryId, departmentId, assignedTo, assignedTo]
+  );
+}
+
 async function create(req, res, next) {
   try {
     const { project_id, title, description, department_id, tat_type, tat_days,
-            due_date, priority, depends_on, parent_task_id } = req.body;
+            due_date, priority, depends_on, parent_task_id, territory_id: bodyTerritoryId } = req.body;
     const { role, id: userId, department_id: userDeptId } = req.user;
 
     if (role === 'hod' && Number(department_id) !== Number(userDeptId)) {
@@ -95,20 +184,44 @@ async function create(req, res, next) {
       if (parents[0].parent_task_id) return res.status(400).json({ message: 'Cannot create a subtask of a subtask' });
     }
 
-    const [rows] = await db.query(
-      `INSERT INTO tasks (project_id, title, description, department_id, status, tat_type, tat_days,
-                          due_date, priority, depends_on, parent_task_id, is_from_template, created_by)
-       VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, false, ?) RETURNING id`,
-      [project_id, title, description, department_id || null, tat_type || 'days',
-       tat_days || null, due_date || null, priority || 'medium',
-       depends_on || null, parent_task_id || null, userId]
-    );
-    const taskId = rows[0].id;
-    await db.query(
-      'INSERT INTO task_status_history (task_id, changed_by, old_status, new_status) VALUES (?, ?, NULL, ?)',
-      [taskId, userId, 'pending']
-    );
-    res.status(201).json({ id: taskId, title });
+    // Resolve territory_id: use provided value, or fall back to project's territory
+    let territory_id = bodyTerritoryId || null;
+    if (!territory_id && project_id) {
+      const [projRows] = await db.query('SELECT territory_id FROM projects WHERE id = ?', [project_id]);
+      if (projRows[0]) territory_id = projRows[0].territory_id || null;
+    }
+
+    const conn = await db.getConnection();
+    await conn.beginTransaction();
+    try {
+      const [rows] = await conn.query(
+        `INSERT INTO tasks (project_id, title, description, department_id, status, tat_type, tat_days,
+                            due_date, priority, depends_on, parent_task_id, territory_id, is_from_template, created_by)
+         VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, false, ?) RETURNING id`,
+        [project_id, title, description, department_id || null, tat_type || 'days',
+         tat_days || null, due_date || null, priority || 'medium',
+         depends_on || null, parent_task_id || null, territory_id, userId]
+      );
+      const taskId = rows[0].id;
+
+      await conn.query(
+        'INSERT INTO task_status_history (task_id, changed_by, old_status, new_status) VALUES (?, ?, NULL, ?)',
+        [taskId, userId, 'pending']
+      );
+
+      // Auto-assign if territory and department are both present
+      if (territory_id && department_id) {
+        await autoAssign(conn, taskId, territory_id, department_id, userId);
+      }
+
+      await conn.commit();
+      res.status(201).json({ id: taskId, title });
+    } catch (err) {
+      await conn.rollback();
+      throw err;
+    } finally {
+      conn.release();
+    }
   } catch (err) { next(err); }
 }
 
